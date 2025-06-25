@@ -1,0 +1,532 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from tkcalendar import DateEntry
+import pandas as pd
+from datetime import datetime, date
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+import os
+import tempfile
+
+class ToolTip:
+    def __init__(self, widget):
+        self.widget = widget
+        self.tipwindow = None
+
+    def showtip(self, text, x, y):
+        if self.tipwindow or not text:
+            return
+        self.tipwindow = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(1)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(tw, text=text, background="#ffffe0", relief="solid", borderwidth=1, font=("tahoma", "10", "normal"))
+        label.pack(ipadx=1)
+
+    def hidetip(self):
+        tw = self.tipwindow
+        self.tipwindow = None
+        if tw:
+            tw.destroy()
+
+class ExitirioApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Καταγραφή Εξιτηρίων")
+        self.filename = "eksitiria.xlsx"
+
+        self.data = pd.DataFrame(columns=["Επώνυμο", "Όνομα", "Ημερομηνία Εξιτηρίου", "Κλινική", "Προορισμός"])
+        self.sort_by = tk.StringVar(value="Επώνυμο")
+        self.filters = {
+            "Επώνυμο": tk.StringVar(),
+            "Όνομα": tk.StringVar(),
+            "Κλινική": tk.StringVar(),
+            "Προορισμός": tk.StringVar()
+        }
+        self.editing_index = None
+
+        self.create_widgets()
+        self.load_on_startup()
+
+    def create_widgets(self):
+        frame_inputs = tk.Frame(self.root)
+        frame_inputs.grid(row=0, column=0, sticky="w", padx=10, pady=5)
+
+        labels = ["Επώνυμο", "Όνομα", "Ημερομηνία Εξιτηρίου", "Κλινική", "Προορισμός"]
+        self.entries = {}
+        for i, label in enumerate(labels):
+            tk.Label(frame_inputs, text=label + ":").grid(row=i, column=0, padx=3, pady=2)
+            if label == "Ημερομηνία Εξιτηρίου":
+                entry = DateEntry(frame_inputs, date_pattern="dd/mm/yy")
+            else:
+                entry = tk.Entry(frame_inputs)
+            entry.grid(row=i, column=1, padx=3, pady=2)
+            self.entries[label] = entry
+
+        frame_buttons = tk.Frame(self.root)
+        frame_buttons.grid(row=1, column=0, sticky="w", padx=10, pady=5)
+        tk.Button(frame_buttons, text="Προσθήκη / Αποθήκευση", command=self.save_entry).grid(row=0, column=0, padx=5)
+        tk.Button(frame_buttons, text="Διαγραφή Επιλεγμένου", command=self.delete_entry).grid(row=0, column=1, padx=5)
+        tk.Button(frame_buttons, text="PDF Print", command=self.export_to_pdf).grid(row=0, column=2, padx=5)
+        tk.Button(frame_buttons, text="Φόρτωση από Excel/CSV", command=self.load_from_file).grid(row=0, column=3, padx=5)
+        tk.Button(frame_buttons, text="Αποθήκευση σε Excel", command=self.save_to_excel).grid(row=0, column=4, padx=5)
+        tk.Button(frame_buttons, text="Αποθήκευση σε CSV", command=self.save_to_csv).grid(row=0, column=5, padx=5)
+        tk.Button(frame_buttons, text="Στατιστικά", command=self.show_stats).grid(row=0, column=6, padx=5)
+        tk.Button(frame_buttons, text="Εκτύπωση", command=self.print_direct).grid(row=0, column=7, padx=5)
+        self.theme = tk.StringVar(value="light")
+        tk.Button(frame_buttons, text="Αλλαγή Θέματος", command=self.toggle_theme).grid(row=0, column=8, padx=5)
+        tk.Button(frame_buttons, text="Ημερολόγιο", command=self.show_calendar).grid(row=0, column=9, padx=5)
+
+        frame_sort = tk.Frame(self.root)
+        frame_sort.grid(row=2, column=0, sticky="w", padx=10, pady=5)
+        tk.Label(frame_sort, text="Ταξινόμηση κατά:").grid(row=0, column=0)
+        sort_combo = ttk.Combobox(frame_sort, textvariable=self.sort_by,
+                                  values=list(self.data.columns), state="readonly", width=20)
+        sort_combo.grid(row=0, column=1, padx=5)
+        tk.Button(frame_sort, text="Εφαρμογή", command=self.refresh_treeview).grid(row=0, column=2, padx=5)
+
+        frame_filter = tk.LabelFrame(self.root, text="Φίλτρα Αναζήτησης")
+        frame_filter.grid(row=3, column=0, sticky="w", padx=10, pady=5)
+        self.filter_count_labels = {}
+        for i, (key, var) in enumerate(self.filters.items()):
+            tk.Label(frame_filter, text=key + ":").grid(row=0, column=i * 3)
+            tk.Entry(frame_filter, textvariable=var).grid(row=0, column=i * 3 + 1)
+            count_label = tk.Label(frame_filter, text="0", fg="blue")
+            count_label.grid(row=0, column=i * 3 + 2)
+            self.filter_count_labels[key] = count_label
+            var.trace_add("write", self.on_filter_change)
+
+        for entry in frame_filter.winfo_children():
+            if isinstance(entry, tk.Entry):
+                entry.bind("<Return>", lambda e: self.refresh_treeview())
+
+        frame_tree = tk.Frame(self.root)
+        frame_tree.grid(row=4, column=0, padx=10, pady=10, sticky="nsew")
+
+        self.tree = ttk.Treeview(frame_tree, columns=list(self.data.columns), show="headings", height=15)
+        self.tree.pack(side="left", fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(frame_tree, orient="vertical", command=self.tree.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
+
+        frame_date_filter = tk.Frame(self.root)
+        frame_date_filter.grid(row=3, column=1, sticky="w", padx=10, pady=5)
+        tk.Label(frame_date_filter, text="Από Ημερομηνία:").grid(row=0, column=0)
+        self.filter_date_from = DateEntry(frame_date_filter, date_pattern="dd/mm/yy")
+        self.filter_date_from.grid(row=0, column=1, padx=3, pady=2)
+        self.filter_date_from.bind("<<DateEntrySelected>>", lambda e: self.refresh_treeview())
+        tk.Label(frame_date_filter, text="Έως Ημερομηνία:").grid(row=0, column=2)
+        self.filter_date_to = DateEntry(frame_date_filter, date_pattern="dd/mm/yy")
+        self.filter_date_to.grid(row=0, column=3, padx=3, pady=2)
+        self.filter_date_to.bind("<<DateEntrySelected>>", lambda e: self.refresh_treeview())
+
+        self.label_count = tk.Label(self.root, text="Σύνολο εγγραφών: 0")
+        self.label_count.grid(row=5, column=0, sticky="w", padx=10, pady=5)
+
+        self.tooltip = ToolTip(self.tree)
+        self.tree.bind("<Motion>", self.on_tree_motion)
+        self.tree.bind("<Leave>", lambda e: self.tooltip.hidetip())
+
+        def _on_mousewheel(event):
+            self.tree.yview_scroll(int(-1*(event.delta/120)), "units")
+
+        self.tree.bind("<MouseWheel>", _on_mousewheel)  # Windows
+        self.tree.bind("<Button-4>", lambda e: self.tree.yview_scroll(-1, "units"))  # Linux
+        self.tree.bind("<Button-5>", lambda e: self.tree.yview_scroll(1, "units"))   # Linux
+
+    def on_filter_change(self, *_):
+        self.refresh_treeview()
+
+    def load_on_startup(self):
+        if os.path.exists(self.filename):
+            try:
+                df = pd.read_excel(self.filename)
+                df["Ημερομηνία Εξιτηρίου"] = pd.to_datetime(df["Ημερομηνία Εξιτηρίου"], dayfirst=True, errors="coerce").dt.date
+                self.data = df
+                self.refresh_treeview()
+            except Exception as e:
+                messagebox.showerror("Σφάλμα", f"Σφάλμα κατά τη φόρτωση: {e}")
+
+    def save_entry(self):
+        try:
+            row = {key: self.entries[key].get().strip() for key in self.entries if key != "Ημερομηνία Εξιτηρίου"}
+            date_str = self.entries["Ημερομηνία Εξιτηρίου"].get()
+            date_val = datetime.strptime(date_str, "%d/%m/%y")
+            if date_val.date() > date.today():
+                messagebox.showerror("Σφάλμα", "Η ημερομηνία δεν μπορεί να είναι στο μέλλον.")
+                return
+            row["Ημερομηνία Εξιτηρίου"] = date_val.date()
+            if any(not val for val in row.values()):
+                messagebox.showerror("Σφάλμα", "Συμπλήρωσε όλα τα πεδία.")
+                return
+            if self.editing_index is not None:
+                for i, key in enumerate(self.data.columns):
+                    self.data.at[self.editing_index, key] = list(row.values())[i]
+                self.editing_index = None
+            else:
+                new_df = pd.DataFrame([row])
+                if ((self.data[["Επώνυμο", "Όνομα", "Ημερομηνία Εξιτηρίου", "Κλινική", "Προορισμός"]] == list(row.values())).all(axis=1)).any():
+                    messagebox.showerror("Σφάλμα", "Η εγγραφή υπάρχει ήδη.")
+                    return
+                self.data = pd.concat([self.data, new_df], ignore_index=True)
+            self.save_to_excel()
+            self.refresh_treeview()
+            for entry in self.entries.values():
+                entry.delete(0, tk.END)
+        except Exception as e:
+            messagebox.showerror("Σφάλμα", f"{e}")
+
+    def delete_entry(self):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        confirm = messagebox.askyesno("Επιβεβαίωση", "Θέλεις να διαγράψεις την επιλεγμένη εγγραφή;")
+        if not confirm:
+            return
+        item = selected[0]
+        values = self.tree.item(item, "values")
+        self.data = self.data[~((self.data == pd.Series(values, index=self.data.columns)).all(axis=1))]
+        self.save_to_excel()
+        self.refresh_treeview()
+
+    def refresh_treeview(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        df = self.data.copy()
+        for key, var in self.filters.items():
+            val = var.get().strip().lower()
+            if val:
+                df = df[df[key].astype(str).str.lower().str.contains(val)]
+        try:
+            date_from = self.filter_date_from.get_date()
+            date_to = self.filter_date_to.get_date()
+            if date_from and date_to:
+                df["Ημερομηνία Εξιτηρίου"] = pd.to_datetime(df["Ημερομηνία Εξιτηρίου"], dayfirst=True, errors="coerce")
+                df = df[(df["Ημερομηνία Εξιτηρίου"] >= date_from) & (df["Ημερομηνία Εξιτηρίου"] <= date_to)]
+        except Exception:
+            pass
+        col = self.sort_by.get()
+        if col == "Ημερομηνία Εξιτηρίου":
+            df["Ημερομηνία Εξιτηρίου"] = pd.to_datetime(df["Ημερομηνία Εξιτηρίου"], dayfirst=True, errors="coerce")
+            df = df.sort_values(col)
+        else:
+            df = df.sort_values(col, key=lambda s: s.astype(str).str.lower())
+        for idx, (_, row) in enumerate(df.iterrows()):
+            date_val = row["Ημερομηνία Εξιτηρίου"]
+            if isinstance(date_val, pd.Timestamp):
+                date_val = date_val.to_pydatetime().date()
+            elif isinstance(date_val, datetime):
+                date_val = date_val.date()
+            date_str = date_val.strftime("%d/%m/%y") if pd.notnull(date_val) and not pd.isna(date_val) else ""
+            tag = "evenrow" if idx % 2 == 0 else "oddrow"
+            self.tree.insert("", "end", values=(row["Επώνυμο"], row["Όνομα"], date_str, row["Κλινική"], row["Προορισμός"]), tags=(tag,))
+        self.tree.tag_configure("evenrow", background="#f0f0ff")
+        self.tree.tag_configure("oddrow", background="#ffffff")
+        self.label_count.config(text=f"Σύνολο εγγραφών: {len(df)}")
+
+        # Ενημέρωση μετρητών φίλτρων
+        for key in self.filters:
+            val = self.filters[key].get().strip().lower()
+            if val:
+                count = self.data[self.data[key].astype(str).str.lower().str.contains(val)].shape[0]
+            else:
+                count = self.data.shape[0]
+            self.filter_count_labels[key].config(text=str(count))
+
+    def export_to_pdf(self):
+        # Πάρε τα δεδομένα που φαίνονται αυτή τη στιγμή στο treeview
+        rows = [self.tree.item(item)["values"] for item in self.tree.get_children()]
+        if not rows:
+            messagebox.showwarning("Προειδοποίηση", "Δεν υπάρχουν εγγραφές για εξαγωγή σε PDF.")
+            return
+        file = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF Files", "*.pdf")])
+        if not file:
+            return
+        c = canvas.Canvas(file, pagesize=A4)
+        width, height = A4
+        margin = 50
+        y = height - margin
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(margin, y, "Εξιτήρια")
+        y -= 20
+        c.setFont("Helvetica", 11)
+        c.drawString(margin, y, "Ημερομηνία Εξιτηρίου")
+        c.drawString(margin + 100, y, "Επώνυμο")
+        c.drawString(margin + 200, y, "Όνομα")
+        c.drawString(margin + 300, y, "Κλινική")
+        c.drawString(margin + 400, y, "Προορισμός")
+        y -= 10
+        c.line(margin, y, width - margin, y)
+        y -= 10
+        c.setFont("Helvetica", 11)
+        for row in rows:
+            date_val = row[2]
+            if isinstance(date_val, str):
+                try:
+                    date_val = datetime.strptime(date_val, "%d/%m/%y")
+                except Exception:
+                    date_val = None
+            date_str = date_val.strftime('%d/%m/%y') if date_val else ""
+            line = f"{date_str} - {row[0]} {row[1]} - {row[3]} - {row[4]}"
+            c.drawString(margin, y, line)
+            y -= 15
+            if y < 60:  # νέα σελίδα αν χρειάζεται
+                c.showPage()
+                y = height - margin
+                c.setFont("Helvetica-Bold", 16)
+                c.drawString(margin, y, "Εξιτήρια")
+                y -= 20
+                c.setFont("Helvetica", 11)
+                c.drawString(margin, y, "Ημερομηνία Εξιτηρίου")
+                c.drawString(margin + 100, y, "Επώνυμο")
+                c.drawString(margin + 200, y, "Όνομα")
+                c.drawString(margin + 300, y, "Κλινική")
+                c.drawString(margin + 400, y, "Προορισμός")
+                y -= 10
+                c.line(margin, y, width - margin, y)
+                y -= 10
+                c.setFont("Helvetica", 11)
+        c.setFont("Helvetica-Oblique", 10)
+        c.drawString(margin, y, "Εξαγωγή από την εφαρμογή καταγραφής εξιτηρίων")
+        c.drawString(width - margin - 150, y, f"Ημερομηνία: {datetime.now().strftime('%d/%m/%Y')}")
+        c.save()
+        messagebox.showinfo("PDF", f"Αποθηκεύτηκε ως {file}")
+
+    def save_to_excel(self):
+        try:
+            self.data.to_excel(self.filename, index=False)
+        except Exception as e:
+            print(f"Excel Save Error: {e}")
+
+    def save_to_csv(self):
+        file = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")])
+        if not file:
+            return
+        try:
+            self.data.to_csv(file, index=False)
+            messagebox.showinfo("CSV", f"Αποθηκεύτηκε ως {file}")
+        except Exception as e:
+            messagebox.showerror("Σφάλμα", f"Αποτυχία αποθήκευσης: {e}")
+
+    def load_from_file(self):
+        path = filedialog.askopenfilename(filetypes=[("Excel/CSV Files", "*.xlsx *.csv")])
+        if not path:
+            return
+        try:
+            if path.endswith(".csv"):
+                df = pd.read_csv(path)
+            else:
+                df = pd.read_excel(path)
+            df["Ημερομηνία Εξιτηρίου"] = pd.to_datetime(df["Ημερομηνία Εξιτηρίου"], dayfirst=True, errors="coerce").dt.date
+            self.data = pd.concat([self.data, df], ignore_index=True).drop_duplicates()
+            self.save_to_excel()
+            self.refresh_treeview()
+        except Exception as e:
+            messagebox.showerror("Σφάλμα", f"Αποτυχία φόρτωσης: {e}")
+
+    def on_tree_double_click(self, event):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        values = self.tree.item(selected[0], "values")
+        for idx, row in self.data.iterrows():
+            date_val = row["Ημερομηνία Εξιτηρίου"]
+            if pd.isnull(date_val) or date_val is pd.NaT:
+                date_str = ""
+            else:
+                if isinstance(date_val, str):
+                    try:
+                        date_val = datetime.strptime(date_val, "%Y-%m-%d")
+                    except Exception:
+                        try:
+                            date_val = datetime.strptime(date_val, "%d/%m/%y")
+                        except Exception:
+                            date_val = None
+                if date_val:
+                    date_str = date_val.strftime("%d/%m/%y")
+                else:
+                    date_str = ""
+            if (
+                str(row["Επώνυμο"]) == values[0] and
+                str(row["Όνομα"]) == values[1] and
+                date_str == values[2] and
+                str(row["Κλινική"]) == values[3] and
+                str(row["Προορισμός"]) == values[4]
+            ):
+                self.editing_index = idx
+                break
+        πεδια = ["Επώνυμο", "Όνομα", "Ημερομηνία Εξιτηρίου", "Κλινική", "Προορισμός"]
+        for i, key in enumerate(πεδια):
+            if key == "Ημερομηνία Εξιτηρίου":
+                try:
+                    self.entries[key].set_date(datetime.strptime(values[2], "%d/%m/%y").date())
+                except Exception:
+                    self.entries[key].set_date(date.today())
+            else:
+                self.entries[key].delete(0, tk.END)
+                self.entries[key].insert(0, values[i])
+
+    def show_stats(self):
+        if self.data.empty:
+            messagebox.showinfo("Στατιστικά", "Δεν υπάρχουν εγγραφές.")
+            return
+        kliniki = self.data["Κλινική"].value_counts()
+        proorismos = self.data["Προορισμός"].value_counts()
+        msg = "Εξιτήρια ανά Κλινική:\n"
+        msg += kliniki.to_string() + "\n\nΕξιτήρια ανά Προορισμό:\n"
+        msg += proorismos.to_string()
+        messagebox.showinfo("Στατιστικά", msg)
+
+    def print_direct(self):
+        rows = [self.tree.item(item)["values"] for item in self.tree.get_children()]
+        if not rows:
+            messagebox.showwarning("Προειδοποίηση", "Δεν υπάρχουν εγγραφές για εκτύπωση.")
+            return
+        # Δημιουργία προσωρινού PDF
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            file = tmp.name
+        c = canvas.Canvas(file, pagesize=A4)
+        width, height = A4
+        margin = 50
+        y = height - margin
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(margin, y, "Εξιτήρια")
+        y -= 20
+        c.setFont("Helvetica", 11)
+        c.drawString(margin, y, "Ημερομηνία Εξιτηρίου")
+        c.drawString(margin + 100, y, "Επώνυμο")
+        c.drawString(margin + 200, y, "Όνομα")
+        c.drawString(margin + 300, y, "Κλινική")
+        c.drawString(margin + 400, y, "Προορισμός")
+        y -= 10
+        c.line(margin, y, width - margin, y)
+        y -= 10
+        c.setFont("Helvetica", 11)
+        for row in rows:
+            date_val = row[2]
+            if isinstance(date_val, str):
+                try:
+                    date_val = datetime.strptime(date_val, "%d/%m/%y")
+                except Exception:
+                    date_val = None
+            date_str = date_val.strftime('%d/%m/%y') if date_val else ""
+            line = f"{date_str} - {row[0]} {row[1]} - {row[3]} - {row[4]}"
+            c.drawString(margin, y, line)
+            y -= 15
+            if y < 60:
+                c.showPage()
+                y = height - margin
+                c.setFont("Helvetica-Bold", 16)
+                c.drawString(margin, y, "Εξιτήρια")
+                y -= 20
+                c.setFont("Helvetica", 11)
+                c.drawString(margin, y, "Ημερομηνία Εξιτηρίου")
+                c.drawString(margin + 100, y, "Επώνυμο")
+                c.drawString(margin + 200, y, "Όνομα")
+                c.drawString(margin + 300, y, "Κλινική")
+                c.drawString(margin + 400, y, "Προορισμός")
+                y -= 10
+                c.line(margin, y, width - margin, y)
+                y -= 10
+                c.setFont("Helvetica", 11)
+        c.setFont("Helvetica-Oblique", 10)
+        c.drawString(margin, y, "Εξαγωγή από την εφαρμογή καταγραφής εξιτηρίων")
+        c.drawString(width - margin - 150, y, f"Ημερομηνία: {datetime.now().strftime('%d/%m/%Y')}")
+        c.save()
+        # Αποστολή σε εκτυπωτή (Windows)
+        try:
+            os.startfile(file, "print")
+            messagebox.showinfo("Εκτύπωση", "Το έγγραφο στάλθηκε στον εκτυπωτή.")
+        except Exception as e:
+            messagebox.showerror("Σφάλμα", f"Αποτυχία εκτύπωσης: {e}")
+
+    def on_tree_motion(self, event):
+        region = self.tree.identify("region", event.x, event.y)
+        if region == "cell":
+            row_id = self.tree.identify_row(event.y)
+            if row_id:
+                values = self.tree.item(row_id, "values")
+                text = f"Επώνυμο: {values[0]}\nΌνομα: {values[1]}\nΗμερομηνία: {values[2]}\nΚλινική: {values[3]}\nΠροορισμός: {values[4]}"
+                x = self.tree.winfo_rootx() + event.x + 20
+                y = self.tree.winfo_rooty() + event.y + 10
+                self.tooltip.showtip(text, x, y)
+            else:
+                self.tooltip.hidetip()
+        else:
+            self.tooltip.hidetip()
+
+    def toggle_theme(self):
+        if self.theme.get() == "light":
+            self.root.configure(bg="#222")
+            for widget in self.root.winfo_children():
+                try:
+                    widget.configure(bg="#222", fg="#fff")
+                except:
+                    pass
+            self.theme.set("dark")
+        else:
+            self.root.configure(bg="#f0f0f0")
+            for widget in self.root.winfo_children():
+                try:
+                    widget.configure(bg="#f0f0f0", fg="#000")
+                except:
+                    pass
+            self.theme.set("light")
+
+    def show_calendar(self):
+        from tkcalendar import Calendar
+        win = tk.Toplevel(self.root)
+        win.title("Ημερολόγιο Εξιτηρίων")
+        win.geometry("400x400")
+
+        # Βρες όλες τις ημερομηνίες με εξιτήρια
+        dates = pd.to_datetime(self.data["Ημερομηνία Εξιτηρίου"], errors="coerce").dropna().dt.date.unique()
+        dates_set = set(dates)
+
+        cal = Calendar(win, selectmode='day', date_pattern="dd/mm/y")
+        cal.pack(pady=10, fill="x")
+
+        # Χρωμάτισε τις μέρες με εξιτήρια
+        for d in dates:
+            cal.calevent_create(d, 'Εξιτήριο', 'exitirio')
+        cal.tag_config('exitirio', background='lightblue', foreground='black')
+
+        txt = tk.Text(win, height=15, width=45)
+        txt.pack(pady=5)
+
+        def show_entries(event=None):
+            txt.delete("1.0", tk.END)
+            sel_date = cal.get_date()
+            try:
+                sel_date_dt = datetime.strptime(sel_date, "%d/%m/%y").date()
+            except Exception:
+                sel_date_dt = None
+            if sel_date_dt and sel_date_dt in dates_set:
+                filtered = self.data[self.data["Ημερομηνία Εξιτηρίου"] == sel_date_dt]
+                if not filtered.empty:
+                    for _, row in filtered.iterrows():
+                        txt.insert(tk.END, f"{row['Επώνυμο']} {row['Όνομα']} - {row['Κλινική']} - {row['Προορισμός']}\n")
+                else:
+                    txt.insert(tk.END, "Δεν υπάρχουν εξιτήρια για αυτή την ημερομηνία.")
+            else:
+                txt.insert(tk.END, "Δεν υπάρχουν εξιτήρια για αυτή την ημερομηνία.")
+
+        cal.bind("<<CalendarSelected>>", show_entries)
+        show_entries()
+
+        tk.Button(win, text="Κλείσιμο", command=win.destroy).pack(pady=10)
+
+def on_closing():
+    if messagebox.askokcancel("Έξοδος", "Θέλεις να κλείσεις το πρόγραμμα;"):
+        root.destroy()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ExitirioApp(root)
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    root.mainloop()
+
+ 
+
